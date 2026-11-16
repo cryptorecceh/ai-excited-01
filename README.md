@@ -1,17 +1,8 @@
-# ai-excited-01 — Phoenix out of a supernova
+# Phoenix Supernova — ai-excited-01
 
-A pure-stdlib Python program that procedurally draws one 1024x1024 PNG
-for make.fun's "Make the AI judge excited" bounty: a colossal phoenix
-bursting upward out of a supernova core, wings swept back, embers
-trailing, over a deep indigo starfield, with a thin glowing orbit ring
-tilted across the core and a tiny mountain ridge at the bottom for scale.
+A colossal phoenix bursting from a supernova core, drawn procedurally in
+pure Python (standard library only). Bold orange flame plumes, a glowing
+orbit ring, an indigo starfield, mountain ridges below, and the word RISE.
 
-## Run
-
-```sh
-MAKEFUN_OUTPUT_DIR=/tmp/out python3 main.py
-```
-
-Writes `entry.png` into `$MAKEFUN_OUTPUT_DIR` (default `/output`).
-Deterministic: two runs produce byte-identical files. No third-party
-modules, no network — only `zlib`, `struct`, `math`, `os`, `random`.
+Run: `python3 main.py` — writes `entry.png` (1024x1024, deterministic,
+same bytes on every run).
