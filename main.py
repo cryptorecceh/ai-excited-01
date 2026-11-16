@@ -1,29 +1,12 @@
-#!/usr/bin/env python3
-"""ai-excited-01 -- a colossal phoenix bursting out of a supernova core.
+"""Phoenix bursting out of a supernova core.
 
-Pure-stdlib procedural renderer (Python 3.13, no third-party imports).
-Draws a 1024x1024 PNG and writes it to $MAKEFUN_OUTPUT_DIR/entry.png
-(default /output/entry.png).
+Pure-stdlib procedural drawing (Python 3.13, no third-party modules):
+a colossal firebird rises on a strong diagonal out of one huge glowing
+core, wings swept back, embers trailing, over a deep indigo starfield
+with a thin tilted orbit ring and a tiny silhouetted ridge at the
+bottom for scale. Deterministic: two runs write byte-identical PNGs.
 
-The image: one huge phoenix-firebird tearing upward out of a dying star.
-Layered flame wings sweep the whole frame on a diagonal, a blinding
-white-gold core burns at its heart, a thin tilted ring of starlight cuts
-across the blast, embers stream upward, and a tiny black mountain ridge
-along the bottom gives the scale. Hot orange/gold/cyan on deep indigo.
-
-Deterministic: fixed seeds, no clock, no network, no hash-order
-dependence. Two runs produce byte-identical files.
-
-How it works (fast on purpose -- the grader allows 60 s):
-  1. Paint a smooth "heat" field at 256x256 with distance-field math
-     (radial core glow, vertical flame body, two swept sine-ripple
-     flame wings, a tail, a tilted ring, a jagged mountain silhouette).
-  2. Bilinear-upscale the field to 1024x1024 and map it through a
-     256-entry colour palette (indigo -> violet -> red -> orange ->
-     gold -> white-hot) with C-speed bytes.translate.
-  3. Stamp full-resolution detail straight into the pixel buffer:
-     stars, rising embers, cyan streaks at the wing tips.
-  4. Encode a standard PNG with zlib + struct (filter 0 scanlines).
+Writes $MAKEFUN_OUTPUT_DIR/entry.png (default /output).
 """
 
 import math
@@ -32,345 +15,284 @@ import random
 import struct
 import zlib
 
-W = 1024
-H = 1024
-FW = 256
-FH = 256
+W = H = 1024
+OUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
-# Phoenix heart, in field coordinates (1 cell = 4 px).
-CX = 128.0
-CY = 165.0
+buf = bytearray(W * H * 3)
 
 
-# ---------------------------------------------------------------- palette
-def _build_palette():
-    """256-entry gradient: deep indigo -> violet -> red -> orange ->
-    gold -> white-hot. Returns (tabR, tabG, tabB) translation tables."""
-    stops = [
-        (0.00, (5, 8, 31)),
-        (0.10, (13, 18, 56)),
-        (0.20, (26, 20, 70)),
-        (0.32, (58, 28, 92)),
-        (0.45, (110, 31, 46)),
-        (0.58, (179, 39, 30)),
-        (0.70, (232, 78, 26)),
-        (0.80, (255, 122, 26)),
-        (0.88, (255, 157, 46)),
-        (0.94, (255, 201, 60)),
-        (0.98, (255, 233, 138)),
-        (1.00, (255, 250, 220)),
-    ]
-    pal = []
-    for i in range(256):
-        t = i / 255.0
-        for s in range(len(stops) - 1):
-            t0, c0 = stops[s]
-            t1, c1 = stops[s + 1]
-            if t0 <= t <= t1:
-                f = 0.0 if t1 == t0 else (t - t0) / (t1 - t0)
-                pal.append(tuple(
-                    int(c0[k] + (c1[k] - c0[k]) * f + 0.5) for k in range(3)
-                ))
-                break
-        else:
-            pal.append(stops[-1][1])
-    return (
-        bytes(p[0] for p in pal),
-        bytes(p[1] for p in pal),
-        bytes(p[2] for p in pal),
-    )
+def _add(i, r, g, b):
+    nr = buf[i] + r
+    buf[i] = 255 if nr > 255 else nr
+    ng = buf[i + 1] + g
+    buf[i + 1] = 255 if ng > 255 else ng
+    nb = buf[i + 2] + b
+    buf[i + 2] = 255 if nb > 255 else nb
 
 
-PAL_R, PAL_G, PAL_B = _build_palette()
+def disc(cx, cy, r, color, strength=1.0):
+    """Soft additive disc, brightness fading to the edge."""
+    r2 = r * r
+    x0 = max(0, int(cx - r))
+    x1 = min(W - 1, int(cx + r) + 1)
+    y0 = max(0, int(cy - r))
+    y1 = min(H - 1, int(cy + r) + 1)
+    cr, cg, cb = color
+    for y in range(y0, y1 + 1):
+        dy = y - cy
+        base = y * W * 3
+        for x in range(x0, x1 + 1):
+            dx = x - cx
+            d2 = dx * dx + dy * dy
+            if d2 < r2:
+                f = (1.0 - d2 / r2) * strength
+                _add(base + x * 3, int(cr * f), int(cg * f), int(cb * f))
 
 
-# ------------------------------------------------------------- heat field
-def _wing(dx, dy, dirx, diry, perpx, perpy, ulen=138.0, wscale=1.0,
-          boost=1.0):
-    """Heat of one swept flame wing. (dir) points from the core toward
-    the wing tip; (perp) is its 90-degree rotation. Flame tongues run
-    ALONG the wing (ripples across v), so the wing reads as streaks of
-    fire, not bands across it."""
-    u = dx * dirx + dy * diry
-    if u < 8.0 or u > ulen:
-        return 0.0
-    v = dx * perpx + dy * perpy
-    # Sweep the wing tip upward: the centreline bends toward the sky
-    # as u grows, so the wing arcs instead of ending in a straight edge.
-    # The bend keys off the fixed outer length so every layer of the
-    # wing shares one centreline (no notches where layers end).
-    bend = (u / 138.0) * (u / 138.0)
-    v -= 24.0 * bend
-    width = (26.0 * (1.0 - u / 160.0) + 4.0) * wscale
-    # Taper the width to a point at the tip (no flat chopped end).
-    if u > ulen - 30.0:
-        tt = 1.0 - (u - (ulen - 30.0)) / 30.0
-        width *= tt ** 0.7
-    av = v if v >= 0.0 else -v
-    if av > width:
-        return 0.0
-    # Flame tongues streaking along the wing.
-    tongue = 0.85 + 0.15 * math.sin(v * 0.35 + u * 0.06 + 1.3)
-    along = 1.0 - u / (ulen + 12.0)
-    across = 1.0 - (av / width) * (av / width)
-    w = (along ** 0.8) * (0.35 + 0.65 * across) * tongue * 1.2 * boost
-    # Bright leading edge near the tip.
-    if u > ulen - 33.0:
-        tip = (u - (ulen - 33.0)) / 33.0
-        edge = 1.0 - av / (width + 6.0)
-        if edge > 0.0 and tip * 0.55 * edge > w:
-            w = tip * 0.55 * edge
-    return w if w < 1.0 else 1.0
+def ellipse_streak(x0, y0, x1, y1, width, c_root, c_tip):
+    """One tapered feather: a rotated ellipse, root colour at the base
+    fading to tip colour at the far end, soft edges."""
+    cx = (x0 + x1) * 0.5
+    cy = (y0 + y1) * 0.5
+    dx = x1 - x0
+    dy = y1 - y0
+    length = math.hypot(dx, dy)
+    a = length * 0.5
+    b = width * 0.5
+    ca = dx / length
+    sa = dy / length
+    ia2 = 1.0 / (a * a)
+    ib2 = 1.0 / (b * b)
+    rx = int(a * abs(ca) + b * abs(sa)) + 2
+    ry = int(a * abs(sa) + b * abs(ca)) + 2
+    xa = max(0, int(cx - rx))
+    xb = min(W - 1, int(cx + rx) + 1)
+    ya = max(0, int(cy - ry))
+    yb = min(H - 1, int(cy + ry) + 1)
+    for y in range(ya, yb + 1):
+        dyy = y - cy
+        base = y * W * 3
+        for x in range(xa, xb + 1):
+            dxx = x - cx
+            u = dxx * ca + dyy * sa
+            v = -dxx * sa + dyy * ca
+            q = u * u * ia2 + v * v * ib2
+            if q < 1.0:
+                t = u / a * 0.5 + 0.5
+                f = (1.0 - q) * (1.0 - q)
+                r = int((c_root[0] + (c_tip[0] - c_root[0]) * t) * f)
+                g = int((c_root[1] + (c_tip[1] - c_root[1]) * t) * f)
+                bl = int((c_root[2] + (c_tip[2] - c_root[2]) * t) * f)
+                _add(base + x * 3, r, g, bl)
 
 
-def _build_field():
-    f = [0.0] * (FW * FH)
-    for fy in range(FH):
-        dy = fy - CY
-        bg = 0.045 + 0.05 * (fy / FH)
-        neb = 0.02 * math.sin(fy * 0.11)
-        row = fy * FW
-        for fx in range(FW):
-            dx = fx - CX
-            # --- background: indigo gradient + faint nebula bands ---
-            h = bg + neb * math.sin(fx * 0.043 + 1.7)
-            h += 0.012 * math.sin(fx * 0.021 + fy * 0.017)
-            # --- vignette: darken the far corners ---
-            nd = math.sqrt((dx / 128.0) * (dx / 128.0)
-                           + (dy / 128.0) * (dy / 128.0))
-            if nd > 0.72:
-                t = (nd - 0.72) / 0.28
-                h *= 1.0 - 0.30 * t * t
-            # --- supernova core: blinding radial glow ---
-            r2 = dx * dx + dy * dy
-            core = 1.0 / (1.0 + r2 / 700.0)
-            if core > h:
-                h = core
-            # --- tilted ring of starlight around the core ---
-            rx = dx * 0.906 - dy * 0.423
-            ry = dx * 0.423 + dy * 0.906
-            er = math.sqrt((rx / 54.0) * (rx / 54.0)
-                           + (ry / 17.0) * (ry / 17.0))
-            d = (er - 1.0) * 11.0
-            ring = 0.85 * math.exp(-d * d)
-            if ring > h:
-                h = ring
-            # --- body: vertical flame teardrop above the core ---
-            # Smooth taper to a point at the top; the edges wobble
-            # (width modulated) instead of the heat banding along its
-            # length, so it reads as one continuous flame, not beads.
-            if dy < 6.0:
-                up = -dy
-                if up < 158.0:
-                    wob = 1.0 + 0.12 * math.sin(up * 0.16 + 0.8)
-                    bulge = 1.0 + 0.25 * math.exp(-((up - 135.0) / 10.0) ** 2)
-                    wdt = (30.0 * (1.0 - up / 165.0) + 3.0) * wob * bulge
-                    ax = dx / wdt
-                    if ax < 1.0 and ax > -1.0:
-                        body = (1.0 - ax * ax) * (1.0 - up / 160.0) ** 0.75
-                        if body > h:
-                            h = body
-            # --- tail: flame tongues streaming down from the core ---
-            elif dy > 4.0:
-                down = dy
-                if down < 72.0:
-                    wdt = 24.0 * (1.0 - down / 78.0) + 3.0
-                    ax = dx / wdt
-                    if ax < 1.0 and ax > -1.0:
-                        flick = 0.88 + 0.12 * math.sin(dy * 0.22 - dx * 0.09)
-                        tail = ((1.0 - ax * ax) * (1.0 - down / 76.0) ** 0.8
-                                * flick * 1.3)
-                        if tail > h:
-                            h = tail
-            # --- wings: two huge swept flame wings, layered ---
-            # (bright narrow inner flame inside a broad outer one)
-            wl = _wing(dx, dy, -0.80, -0.60, 0.60, -0.80)
-            if wl > h:
-                h = wl
-            wl2 = _wing(dx, dy, -0.80, -0.60, 0.60, -0.80,
-                        ulen=105.0, wscale=0.50, boost=0.95)
-            if wl2 > h:
-                h = wl2
-            wr = _wing(dx, dy, 0.80, -0.60, -0.60, -0.80)
-            if wr > h:
-                h = wr
-            wr2 = _wing(dx, dy, 0.80, -0.60, -0.60, -0.80,
-                        ulen=105.0, wscale=0.50, boost=0.95)
-            if wr2 > h:
-                h = wr2
-            # --- mountain ridge silhouette along the bottom ---
-            if fy > 228:
-                ridge = (238.0 + 5.0 * math.sin(fx * 0.11)
-                         + 3.5 * math.sin(fx * 0.031 + 2.0)
-                         + 2.5 * math.sin(fx * 0.23 + 1.0))
-                if fy > ridge:
-                    h = 0.012
-                elif fy > ridge - 2.0 and h > 0.05:
-                    h = 0.05
-            f[row + fx] = h if h < 1.0 else 1.0
-    return f
+def bezier(p0, p1, p2, steps):
+    pts = []
+    for i in range(steps + 1):
+        t = i / steps
+        mt = 1.0 - t
+        x = mt * mt * p0[0] + 2 * mt * t * p1[0] + t * t * p2[0]
+        y = mt * mt * p0[1] + 2 * mt * t * p1[1] + t * t * p2[1]
+        pts.append((x, y))
+    return pts
 
 
-# -------------------------------------------------------------- upscale
-def _expand_row(src):
-    """Bilinear horizontal expansion of one 256-wide field row to 1024."""
-    out = []
-    ap = out.append
-    for i in range(FW - 1):
-        a = src[i]
-        b = src[i + 1]
-        ap(a)
-        ap(a * 0.75 + b * 0.25)
-        ap(a * 0.5 + b * 0.5)
-        ap(a * 0.25 + b * 0.75)
-    last = src[FW - 1]
-    ap(last)
-    ap(last)
-    ap(last)
-    ap(last)
-    return out
+# ---------------------------------------------------------------- colours
+GOLD = (255, 214, 106)
+ORANGE = (255, 122, 26)
+MAGENTA = (255, 46, 136)
+VIOLET = (123, 47, 255)
+WHITE = (255, 246, 220)
+CYAN = (125, 249, 255)
+EMBER = (255, 170, 60)
+
+rng = random.Random(20261116)
+
+# ---------------------------------------------------------------- background
+# Deep indigo sky, darker at the corners, a violet wash near the core.
+for y in range(H):
+    ty = y / (H - 1)
+    # top -> bottom gradient
+    br = int(10 + 26 * ty)
+    bg = int(5 + 12 * ty)
+    bb = int(36 + 34 * ty)
+    base = y * W * 3
+    dy = (y - 470) / 512.0
+    for x in range(W):
+        dx = (x - 600) / 512.0
+        d2 = dx * dx + dy * dy
+        # violet wash close to the core, darkness far away
+        wash = 1.0 / (1.0 + d2 * 2.2)
+        vig = 1.0 - 0.45 * min(d2, 1.6)
+        i = base + x * 3
+        buf[i] = int((br + 52 * wash) * vig)
+        buf[i + 1] = int((bg + 18 * wash) * vig)
+        buf[i + 2] = int((bb + 58 * wash) * vig)
+
+# ---------------------------------------------------------------- starfield
+for _ in range(260):
+    x = rng.randint(0, W - 1)
+    y = rng.randint(0, H - 1)
+    m = rng.random()
+    if m < 0.55:
+        s = 1
+    elif m < 0.9:
+        s = 2
+    else:
+        s = 3
+    v = int(90 + 165 * rng.random())
+    col = (v, v, min(255, v + 40)) if rng.random() < 0.7 else (v, int(v * 0.8), int(v * 0.6))
+    disc(x, y, s, col, 0.9)
+    if s == 3:  # bright stars get a little cross sparkle
+        for dx, dy in ((5, 0), (-5, 0), (0, 5), (0, -5)):
+            disc(x + dx, y + dy, 1, col, 0.7)
+
+# ---------------------------------------------------------------- ridge
+# Tiny silhouetted mountain ridge along the bottom, for scale.
+peaks = [(0, 985), (90, 948), (170, 972), (260, 930), (350, 968),
+         (470, 940), (560, 972), (660, 928), (760, 966), (860, 942),
+         (950, 970), (1024, 950)]
+for x in range(W):
+    for k in range(len(peaks) - 1):
+        ax, ay = peaks[k]
+        bx, by = peaks[k + 1]
+        if ax <= x <= bx:
+            t = (x - ax) / max(1, bx - ax)
+            ry = int(ay + (by - ay) * t)
+            break
+    for y in range(ry, H):
+        i = (y * W + x) * 3
+        buf[i] = 4
+        buf[i + 1] = 3
+        buf[i + 2] = 14
+
+# ---------------------------------------------------------------- supernova core
+# Wide magenta halo + tight white-gold heart, additive.
+CX, CY = 600, 470
+for y in range(0, H):
+    dy = y - CY
+    base = y * W * 3
+    for x in range(0, W):
+        dx = x - CX
+        d2 = dx * dx + dy * dy
+        halo = 1.0 / (1.0 + d2 / 9000.0)
+        heart = 1.0 / (1.0 + d2 / 1400.0)
+        r = int(255 * heart + 200 * halo)
+        g = int(190 * heart + 40 * halo)
+        b = int(90 * heart + 130 * halo)
+        i = base + x * 3
+        nr = buf[i] + r
+        buf[i] = 255 if nr > 255 else nr
+        ng = buf[i + 1] + g
+        buf[i + 1] = 255 if ng > 255 else ng
+        nb = buf[i + 2] + b
+        buf[i + 2] = 255 if nb > 255 else nb
+# Blinding white heart
+disc(CX, CY, 70, WHITE, 1.0)
+disc(CX, CY, 34, (255, 255, 255), 1.0)
+
+# ---------------------------------------------------------------- wings
+# Upper wing: fan of feathers sweeping up-left from the body.
+upper_tips = [(140, 285), (168, 348), (200, 408), (238, 462),
+              (282, 505), (330, 535), (382, 552)]
+for tx, ty in upper_tips:
+    ellipse_streak(560, 505, tx, ty, 30, GOLD, MAGENTA)
+# Lower wing: fan sweeping down-left, hotter at the root.
+lower_tips = [(150, 648), (192, 706), (244, 752), (300, 788),
+              (358, 808), (414, 814)]
+for tx, ty in lower_tips:
+    ellipse_streak(520, 592, tx, ty, 28, ORANGE, VIOLET)
+# Wing undersides: a second, deeper violet layer behind each fan.
+for tx, ty in [(170, 330), (230, 440), (300, 520)]:
+    ellipse_streak(545, 530, tx + 40, ty + 55, 22, MAGENTA, VIOLET)
+for tx, ty in [(200, 690), (280, 770), (360, 800)]:
+    ellipse_streak(520, 610, tx + 30, ty + 30, 20, MAGENTA, VIOLET)
+
+# ---------------------------------------------------------------- tail ribbons
+# Three curved ribbons streaming down-left from the body base.
+tails = [((370, 790), (180, 880), (110, 965), MAGENTA),
+         ((380, 800), (260, 905), (200, 985), ORANGE),
+         ((390, 795), (330, 895), (300, 970), VIOLET)]
+for p0, p1, p2, col in tails:
+    pts = bezier(p0, p1, p2, 60)
+    for n, (x, y) in enumerate(pts):
+        t = n / len(pts)
+        disc(x, y, 15 - 11 * t, col, 0.85)
+        disc(x, y, 6 - 4 * t, GOLD, 0.7)
+
+# ---------------------------------------------------------------- body + head
+# Body: overlapping discs along a gently curving rising path,
+# white-hot spine over a gold-orange body.
+body_pts = bezier((360, 800), (540, 600), (705, 295), 40)
+for n, (x, y) in enumerate(body_pts):
+    t = n / 40.0
+    disc(x, y, 48 - 30 * t, (255, 150, 40), 0.55)
+for n, (x, y) in enumerate(body_pts):
+    t = n / 40.0
+    disc(x, y, 26 - 14 * t, GOLD, 0.8)
+for n, (x, y) in enumerate(body_pts):
+    t = n / 40.0
+    disc(x, y, 11 - 5 * t, WHITE, 0.8)
+# Head + beak + crest flames, pointing up-right.
+disc(708, 292, 30, GOLD, 1.0)
+disc(708, 292, 16, WHITE, 1.0)
+ellipse_streak(720, 285, 775, 245, 14, GOLD, ORANGE)   # beak
+for tx, ty in [(745, 225), (720, 215), (690, 220)]:
+    ellipse_streak(700, 275, tx, ty, 12, ORANGE, MAGENTA)  # crest
+# Eye: dark dot with a white glint.
+disc(712, 288, 5, (20, 8, 30), 1.0)
+disc(714, 286, 2, WHITE, 1.0)
+
+# ---------------------------------------------------------------- orbit ring
+# Thin glowing ring tilted across the core, cyan-white.
+for deg in range(0, 360):
+    th = math.radians(deg)
+    rx, ry = 345, 118
+    px = rx * math.cos(th)
+    py = ry * math.sin(th)
+    ca, sa = math.cos(-0.49), math.sin(-0.49)
+    x = CX + px * ca - py * sa
+    y = CY + px * sa + py * ca
+    disc(x, y, 4, CYAN, 0.55)
+    disc(x, y, 2, WHITE, 0.9)
+# Fainter outer ring.
+for deg in range(0, 360, 2):
+    th = math.radians(deg)
+    rx, ry = 400, 140
+    px = rx * math.cos(th)
+    py = ry * math.sin(th)
+    ca, sa = math.cos(-0.49), math.sin(-0.49)
+    x = CX + px * ca - py * sa
+    y = CY + px * sa + py * ca
+    disc(x, y, 2, (90, 160, 255), 0.4)
+
+# ---------------------------------------------------------------- embers
+# Glowing embers trailing the bird's diagonal path.
+for _ in range(110):
+    t = rng.random()
+    x = 300 + 560 * t + rng.randint(-90, 90)
+    y = 850 - 640 * t + rng.randint(-90, 90)
+    s = rng.choice([1, 2, 2, 3])
+    col = rng.choice([GOLD, EMBER, ORANGE, MAGENTA])
+    disc(x, y, s + 2, col, 0.5)
+    disc(x, y, s, WHITE, 0.8)
+
+# ---------------------------------------------------------------- PNG encode
+def chunk(tag, data):
+    c = struct.pack(">I", len(data)) + tag + data
+    return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
 
 
-def _upscale(field):
-    """256x256 heat field -> 1024x1024 RGB bytearray via the palette."""
-    expanded = [_expand_row(field[y * FW:(y + 1) * FW]) for y in range(FH)]
-    weights = ((1.0, 0.0), (0.75, 0.25), (0.5, 0.5), (0.25, 0.75))
-    img = bytearray(W * H * 3)
-    for y in range(H):
-        sy = y // 4
-        wa, wb = weights[y % 4]
-        row_a = expanded[sy]
-        row_b = expanded[sy + 1] if sy + 1 < FH else row_a
-        heat = bytes(
-            int(min(1.0, a * wa + b * wb) * 255) for a, b in zip(row_a, row_b)
-        )
-        r = heat.translate(PAL_R)
-        g = heat.translate(PAL_G)
-        b = heat.translate(PAL_B)
-        o = y * W * 3
-        img[o:o + W * 3:3] = r
-        img[o + 1:o + W * 3:3] = g
-        img[o + 2:o + W * 3:3] = b
-    return img
+ihdr = struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)
+raw = bytearray()
+for y in range(H):
+    raw.append(0)  # filter: none
+    raw += buf[y * W * 3:(y + 1) * W * 3]
+png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+       + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+       + chunk(b"IEND", b""))
 
-
-# ------------------------------------------------------- full-res detail
-def _add(img, x, y, r, g, b):
-    if 0 <= x < W and 0 <= y < H:
-        o = (y * W + x) * 3
-        v = img[o] + r
-        img[o] = 255 if v > 255 else v
-        v = img[o + 1] + g
-        img[o + 1] = 255 if v > 255 else v
-        v = img[o + 2] + b
-        img[o + 2] = 255 if v > 255 else v
-
-
-def _detail(img):
-    rng = random.Random(20261116)
-    # --- stars, mostly in the upper sky ---
-    for _ in range(420):
-        x = rng.randrange(W)
-        y = rng.randrange(760)
-        br = rng.randrange(60, 256)
-        col = (br, br, 255) if rng.random() < 0.7 else (255, 225, 160)
-        _add(img, x, y, col[0], col[1], col[2])
-        if rng.random() < 0.12:  # a few bright stars get a cross sparkle
-            _add(img, x - 1, y, br // 2, br // 2, br // 2)
-            _add(img, x + 1, y, br // 2, br // 2, br // 2)
-            _add(img, x, y - 1, br // 2, br // 2, br // 2)
-            _add(img, x, y + 1, br // 2, br // 2, br // 2)
-    # --- embers streaming up and out from the core ---
-    for _ in range(300):
-        ang = rng.uniform(-math.pi + 0.25, -0.25)  # upward fan
-        dist = rng.uniform(60.0, 480.0)
-        jx = rng.uniform(-26.0, 26.0)
-        jy = rng.uniform(-26.0, 26.0)
-        x = int(512 + math.cos(ang) * dist + jx)
-        y = int(660 + math.sin(ang) * dist + jy)
-        fade = 1.0 - dist / 560.0
-        br = int(rng.uniform(120, 255) * fade) + 40
-        gold = rng.random() < 0.75
-        if gold:
-            _add(img, x, y, br, int(br * 0.55), int(br * 0.15))
-        else:
-            _add(img, x, y, int(br * 0.25), int(br * 0.7), br)
-        if rng.random() < 0.3:  # glowing halo around some embers
-            _add(img, x - 1, y, br // 4, br // 6, 0)
-            _add(img, x + 1, y, br // 4, br // 6, 0)
-            _add(img, x, y - 1, br // 4, br // 6, 0)
-            _add(img, x, y + 1, br // 4, br // 6, 0)
-    # --- crisp ring of starlight, drawn at full resolution so it cuts
-    # across the bright wings instead of being swallowed by them ---
-    # (tilted ellipse around the core; the near arc burns brighter)
-    steps = 1400
-    for i in range(steps):
-        t = 2.0 * math.pi * i / steps
-        # ellipse in its own plane, then tilted -25 degrees
-        ex = 232.0 * math.cos(t)
-        ey = 72.0 * math.sin(t)
-        x = int(512 + ex * 0.906 - ey * 0.423)
-        y = int(660 + ex * 0.423 + ey * 0.906)
-        near = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(t))
-        br = int(215 * near)
-        _add(img, x, y, br, int(br * 0.62), int(br * 0.16))
-        _add(img, x, y + 1, br // 2, br // 3, br // 8)
-        _add(img, x, y - 1, br // 2, br // 3, br // 8)
-    # --- cyan streaks flashing at the wing tips ---
-    for _ in range(36):
-        side = -1.0 if rng.random() < 0.5 else 1.0
-        u = rng.uniform(95.0, 135.0)
-        v = rng.uniform(-18.0, 18.0)
-        # wing-tip point in field coords -> image coords
-        fx = CX + side * 0.80 * u + side * 0.60 * v
-        fy = CY - 0.60 * u - 0.80 * v
-        x0 = int(fx * 4)
-        y0 = int(fy * 4)
-        ln = rng.randrange(8, 18)
-        dx = int(side * 2)
-        dy = -1
-        for i in range(ln):
-            fade = 1.0 - i / ln
-            # 2x2 blocks tile into a continuous glowing slash
-            for ox in (0, 1):
-                for oy in (0, 1):
-                    _add(img, x0 + dx * i + ox, y0 + dy * i + oy,
-                         int(40 * fade), int(220 * fade), int(255 * fade))
-
-
-# ------------------------------------------------------------------- PNG
-def _chunk(tag, data):
-    out = struct.pack(">I", len(data)) + tag + data
-    return out + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-
-
-def _encode_png(rgb):
-    raw = bytearray()
-    for y in range(H):
-        raw.append(0)
-        raw += rgb[y * W * 3:(y + 1) * W * 3]
-    comp = zlib.compress(bytes(raw), 9)
-    ihdr = struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)
-    return (b"\x89PNG\r\n\x1a\n"
-            + _chunk(b"IHDR", ihdr)
-            + _chunk(b"IDAT", comp)
-            + _chunk(b"IEND", b""))
-
-
-def main():
-    import time
-    t0 = time.time()
-    field = _build_field()
-    img = _upscale(field)
-    _detail(img)
-    png = _encode_png(img)
-    outdir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    os.makedirs(outdir, exist_ok=True)
-    path = os.path.join(outdir, "entry.png")
-    with open(path, "wb") as fh:
-        fh.write(png)
-    print("wrote %s (%d bytes) in %.2fs" % (path, len(png), time.time() - t0))
-
-
-if __name__ == "__main__":
-    main()
+os.makedirs(OUT_DIR, exist_ok=True)
+with open(os.path.join(OUT_DIR, "entry.png"), "wb") as f:
+    f.write(png)
+print(f"wrote {os.path.join(OUT_DIR, 'entry.png')} ({len(png)} bytes)")
